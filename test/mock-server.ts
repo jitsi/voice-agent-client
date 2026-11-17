@@ -36,6 +36,12 @@ export class MockProvisioningServer {
     roomExists = true;
     inviteCalls = 0;
     streamOpens = 0;
+    /** When set, every request is answered with a 307 to this URL. */
+    redirectTo?: string;
+    /** Ends each stream as soon as it has opened: what a proxy that cannot hold a stream does. */
+    closeOnOpen = false;
+    /** The headers of the newest request. */
+    lastHeaders: http.IncomingHttpHeaders = {};
     private server?: http.Server;
     private readonly streams = new Set<Stream>();
     private readonly buffer: { id: string; conference: string; frame: string }[] = [];
@@ -73,6 +79,9 @@ export class MockProvisioningServer {
         this.inviteCalls = 0;
         this.requests.length = 0;
         this.streamOpens = 0;
+        this.redirectTo = undefined;
+        this.closeOnOpen = false;
+        this.lastHeaders = {};
     }
 
     /** Writes a frame as given to every open stream: what a broken or hostile server might send. */
@@ -119,6 +128,14 @@ export class MockProvisioningServer {
         const url = new URL(req.url ?? '/', 'http://localhost');
 
         this.requests.push(`${req.method} ${url.pathname}${url.search}`);
+        this.lastHeaders = req.headers;
+        if (this.redirectTo) {
+            req.resume();
+            res.writeHead(307, { location: this.redirectTo });
+            res.end();
+
+            return;
+        }
         // The tenant-prefixed form a HAProxy-routed caller sends; nginx strips it before prosody sees the path.
         url.pathname = url.pathname.replace(/^\/[^/]+(?=\/voice-agent\/)/, '');
 
@@ -207,5 +224,8 @@ export class MockProvisioningServer {
             res.write(`id: ${this.epoch}-${this.seq}\nevent: snapshot\ndata: ${JSON.stringify({ conference, agents })}\n\n`);
         }
         res.write(': keepalive\n\n');
+        if (this.closeOnOpen) {
+            res.end();
+        }
     }
 }

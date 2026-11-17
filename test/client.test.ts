@@ -5,6 +5,7 @@ import {
     VoiceAgentApiError,
     VoiceAgentClient,
     VoiceAgentStateError,
+    VoiceAgentStreamError,
     VoiceAgentTimeoutError,
     type LifecycleEvent,
     type SnapshotEvent,
@@ -219,6 +220,160 @@ describe('VoiceAgentClient', () => {
         assert.ok(new VoiceAgentClient({ baseUrl: 'http://api.example.com/voice-agent', token: 't', allowHttp: true }));
         assert.ok(new VoiceAgentClient({ baseUrl: 'https://api.example.com/voice-agent', token: 't' }));
         assert.ok(new VoiceAgentClient({ baseUrl: 'http://localhost:5280/voice-agent', token: 't' }));
+        assert.ok(new VoiceAgentClient({ baseUrl: 'http://127.0.0.1:5280/voice-agent', token: 't' }));
+        assert.throws(() => new VoiceAgentClient({ baseUrl: 'http://127.example.com/voice-agent', token: 't' }), TypeError,
+            'a host name that only starts like a loopback address is not one');
+    });
+
+    test('rejects a base URL with credentials, a query or a fragment', () => {
+        assert.throws(() => new VoiceAgentClient({ baseUrl: 'https://user:hunter2@api.example.com/voice-agent', token: 't' }),
+            (error: unknown) => error instanceof TypeError && !error.message.includes('hunter2'));
+        assert.throws(() => new VoiceAgentClient({ baseUrl: 'https://api.example.com/voice-agent?x=1', token: 't' }), /query or a fragment/);
+        assert.throws(() => new VoiceAgentClient({ baseUrl: 'https://api.example.com/voice-agent#x', token: 't' }), /query or a fragment/);
+    });
+
+    test('a redirect is an error answer and is not followed', async () => {
+        const other = new MockProvisioningServer();
+
+        server.redirectTo = `${await other.start()}/invite`;
+        try {
+            await assert.rejects(inviteSupport(client()), (error: unknown) =>
+                error instanceof VoiceAgentApiError && error.status === 307 && error.message.includes(`${server.redirectTo}, not followed`));
+            await assert.rejects((async () => {
+                for await (const event of client().events({ conference: CONFERENCE })) {
+                    assert.fail(`unexpected event ${event.event}`);
+                }
+            })(), (error: unknown) => error instanceof VoiceAgentApiError && error.status === 307);
+            assert.deepEqual(other.requests, [], 'nothing reached the redirect target');
+        } finally {
+            await other.stop();
+        }
+    });
+
+    test('the headers the client sets replace a caller header of any spelling', async () => {
+        const c = new VoiceAgentClient({
+            baseUrl,
+            token: server.token,
+            headers: { Authorization: 'Basic other', ACCEPT: 'text/html', 'Last-Event-ID': 'x', 'X-Extra': '1' }
+        });
+
+        await c.list(CONFERENCE);
+        assert.equal(server.lastHeaders.authorization, `Bearer ${server.token}`);
+        assert.equal(server.lastHeaders.accept, 'application/json');
+        assert.equal(server.lastHeaders['last-event-id'], undefined);
+        assert.equal(server.lastHeaders['x-extra'], '1');
+    });
+
+    test('a token that a header cannot carry is refused without being named', async () => {
+        const hidden = (error: unknown) => error instanceof TypeError && !error.message.includes('s3cret');
+        const noToken = undefined as unknown as string;
+
+        assert.throws(() => new VoiceAgentClient({ baseUrl, token: 's3cret\u0000tail' }), hidden);
+        await assert.rejects(new VoiceAgentClient({ baseUrl, token: () => 's3cret\u0000tail' }).list(CONFERENCE), hidden);
+        await assert.rejects(new VoiceAgentClient({ baseUrl, token: () => 's3cret\u00e9' }).list(CONFERENCE), hidden);
+        await assert.rejects(new VoiceAgentClient({ baseUrl, token: () => noToken }).list(CONFERENCE), TypeError);
+        assert.deepEqual(Object.keys(await new VoiceAgentClient({ baseUrl, token: `${server.token}\n` }).list(CONFERENCE)), [],
+            'white space around a token is not part of it');
+    });
+
+    test('a 2xx answer of the wrong shape is refused', async () => {
+        const answering = (body: unknown) =>
+            new VoiceAgentClient({ baseUrl, token: 't', fetch: async () => new Response(JSON.stringify(body), { status: 200 }) });
+
+        for (const body of [ null, [], 7, { agentId: 5 }, { agents: {} } ]) {
+            const c = answering(body);
+
+            await assert.rejects(inviteSupport(c), VoiceAgentStreamError);
+            await assert.rejects(c.dismiss(CONFERENCE, 'support'), VoiceAgentStreamError);
+            await assert.rejects(c.get(CONFERENCE, 'support'), VoiceAgentStreamError);
+        }
+        for (const body of [ null, [], 7, { agents: 'none' }, { agents: [ 1 ] } ]) {
+            await assert.rejects(answering(body).list(CONFERENCE), VoiceAgentStreamError);
+        }
+    });
+
+    test('list returns only agents, in an object without a prototype', async () => {
+        const answer = '{"agents":{"agent-a":{"displayName":"A","sourceName":"agent-a-a0","state":"active","__proto__":{"x":1}},'
+            + '"__proto__":{"displayName":"P","sourceName":"p","state":"active"},"agent-b":5,"agent-c":{"state":"active"}}}';
+        const c = new VoiceAgentClient({ baseUrl, token: 't', fetch: async () => new Response(answer, { status: 200 }) });
+        const agents = await c.list(CONFERENCE);
+
+        assert.deepEqual(Object.keys(agents), [ 'agent-a' ]);
+        assert.equal(Object.getPrototypeOf(agents), null);
+        assert.equal(agents.constructor, undefined);
+        assert.equal(Object.hasOwn(agents['agent-a'] ?? {}, '__proto__'), false);
+        assert.equal(Object.keys(await new VoiceAgentClient({ baseUrl, token: 't', fetch: async () => new Response('{"agents":[]}') }).list(CONFERENCE)).length, 0);
+    });
+
+    test('server text in an error message is bounded and on one line', async () => {
+        const text = `bad\n2026-01-01 forged line \u001b[31m${'x'.repeat(5000)}`;
+        const c = new VoiceAgentClient({ baseUrl, token: 't', fetch: async () => new Response(JSON.stringify({ error: text }), { status: 400 }) });
+        const oneLine = (message: string) => message.length < 300 && !/[\u0000-\u001f\u007f]/.test(message);
+
+        await assert.rejects(c.list(CONFERENCE), (error: unknown) =>
+            error instanceof VoiceAgentApiError && oneLine(error.message) && (error.body as { error: string }).error === text);
+        assert.ok(oneLine(new VoiceAgentStateError('agent-a', 'failed', text).message));
+    });
+
+    test('lifecycle events lose unsafe keys and optional fields of the wrong type', async () => {
+        const c = client();
+
+        await inviteSupport(c);
+        const stream = c.events({ conference: CONFERENCE });
+        const iterator = stream[Symbol.asyncIterator]();
+
+        await iterator.next();
+        server.emitRaw('event: agent.ended\ndata: {"agentId":"agent-support","conference":"acme/room1","state":"ended","timestamp":5}\n\n');
+        server.emitRaw('event: agent.failed\ndata: {"agentId":"agent-support","conference":"acme/room1","state":"failed",'
+            + '"reason":{"x":1},"__proto__":{"polluted":true},"constructor":1,"later":{"kept":true,"__proto__":{"polluted":true}}}\n\n');
+        const event = lifecycle((await iterator.next()).value) as LifecycleEvent & { later?: object };
+
+        assert.equal(event.event, 'agent.failed', 'an event whose timestamp is not a string is dropped');
+        assert.equal(event.reason, undefined);
+        assert.deepEqual(event.later, { kept: true }, 'a field the client does not know is passed on, cleaned at every depth');
+        assert.equal(Object.hasOwn(event.later ?? {}, '__proto__'), false);
+        assert.equal(Object.hasOwn(event, '__proto__'), false);
+        assert.equal(Object.hasOwn(event, 'constructor'), false);
+        assert.equal(({} as { polluted?: boolean }).polluted, undefined);
+        stream.close();
+    });
+
+    test('a stream that ends as soon as it opens is redialed with backoff', async () => {
+        const c = client();
+
+        server.closeOnOpen = true;
+        const stream = c.events({ conference: CONFERENCE, reconnect: { initialDelayMs: 100, maxDelayMs: 200 } });
+
+        setTimeout(() => stream.close(), 700);
+        for await (const event of stream) {
+            assert.equal(event.event, 'snapshot');
+        }
+        assert.ok(server.streamOpens >= 2 && server.streamOpens <= 8, `expected a few paced redials, saw ${server.streamOpens}`);
+    });
+
+    test('a delay under the floor is raised to it', async () => {
+        server.roomExists = false;
+        await assert.rejects(client().invite({ conference: CONFERENCE, displayName: 'A', endpoint: { url: 'wss://bot.example.com/ws' } },
+            { waitForRoom: { timeoutMs: 350, intervalMs: 0 } }), VoiceAgentApiError);
+        assert.ok(server.inviteCalls >= 2 && server.inviteCalls <= 5, `expected a call per 100 ms, saw ${server.inviteCalls}`);
+    });
+
+    test('a stream that lived is redialed at once when the server closes it', async () => {
+        const c = client();
+
+        await inviteSupport(c);
+        const stream = c.events({ conference: CONFERENCE, reconnect: { initialDelayMs: 5000 } });
+        const iterator = stream[Symbol.asyncIterator]();
+
+        await iterator.next();
+        await new Promise(resolve => setTimeout(resolve, 1100));
+        server.closeStreams();
+        const closedAt = Date.now();
+
+        server.emit('agent.connected', 'agent-support');
+        assert.equal(lifecycle((await iterator.next()).value).event, 'agent.connected');
+        assert.ok(Date.now() - closedAt < 2000, 'no backoff after a stream that stayed open');
+        stream.close();
     });
 
     test('drops malformed events and ids it cannot send back, without reconnecting', async () => {
@@ -298,6 +453,9 @@ describe('VoiceAgentClient', () => {
         assert.match(server.requests.at(-1) ?? '', /^GET \/a%20b%3Fx%23y\/voice-agent\/list\?/, 'the tenant stays one path segment');
         await assert.rejects(c.list('a/b/c'), /does not name one room/);
         await assert.rejects(c.list('../room1'), /does not name a tenant/);
+        await assert.rejects(c.list(`acme/${'r'.repeat(3000)}`), /longer than/);
+        await c.list('//acme/room1//');
+        assert.match(server.requests.at(-1) ?? '', /^GET \/acme\/voice-agent\/list\?.*&room=room1$/, 'slashes around the name are not part of it');
     });
 
     test('direct routing (the default) leaves the URL alone', async () => {
