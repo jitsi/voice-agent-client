@@ -56,13 +56,14 @@ await client.dismiss('acme/room1', agent.agentId);
 | --- | --- | --- |
 | `invite(request, { waitForRoom?, signal? })` | `POST invite` | Idempotent on `agentId`. `waitForRoom` retries the 404 a room answers before its first participant joins (30 s at 1 s by default, or `{ timeoutMs, intervalMs }`). |
 | `dismiss(conference, agentId)` | `POST dismiss` | Closes the agent's media leg; `agent.ended` follows. |
-| `list(conference)` | `GET list` | Every agent in the meeting, keyed by `agentId`. |
+| `list(conference)` | `GET list` | Every agent in the meeting, keyed by `agentId`, in an object without a prototype. |
 | `get(conference, agentId)` | `GET get` | The agent's state, or `undefined` once it is gone. |
 | `events({ conference?, lastEventId?, reconnect?, signal? })` | `GET events` | An `EventStream`: iterate with `for await`, stop with `close()`. |
 | `waitFor(conference, agentId, state, { timeoutMs?, signal? })` | | Resolves when the agent reaches the state (from the snapshot or a later event); rejects with `VoiceAgentStateError` on another terminal state, `VoiceAgentTimeoutError` after `timeoutMs`. |
 
-Errors: a non-2xx answer is a `VoiceAgentApiError` with `status` and the parsed `body`; a stream that is not
-`text/event-stream` or carries malformed event data is a `VoiceAgentStreamError`.
+Errors: a non-2xx answer is a `VoiceAgentApiError` with `status` and the parsed `body`, a redirect included,
+since the client does not follow one; a stream that is not `text/event-stream`, a body past its size limit, or a
+2xx answer that does not have the shape of its route is a `VoiceAgentStreamError`.
 
 ## The agent endpoint (the media half)
 
@@ -110,10 +111,11 @@ from the Jitsi team in the meantime.
 the stream covers every room the credential can see. Each event carries an opaque `id`.
 
 The client keeps one logical stream across reconnects: when the server closes a stream at its max age or the
-connection drops, it reconnects (immediately after a server close, with doubling backoff from 1 s to 30 s after a
-failure) and sends `Last-Event-ID`. The server then replays the events missed when it still has them, or sends a
-fresh `snapshot`, so your loop sees either an exact continuation or the current state, never a gap. Unknown event
-types are ignored, as the contract requires, and 4xx answers other than 429 are not retried.
+connection drops, it reconnects and sends `Last-Event-ID`: at once after a server close, with doubling backoff from
+1 s to 30 s after a failure or after a stream that ended within a second of opening. The server then replays the
+events missed when it still has them, or sends a fresh `snapshot`, so your loop sees either an exact continuation
+or the current state, never a gap. Unknown event types are ignored, as the contract requires, and 4xx answers other
+than 429 are not retried.
 
 ## Sharded deployments
 
@@ -136,13 +138,20 @@ default, `direct`, is for a single prosody or a gateway that routes by itself.
 
 ## Security notes
 
-- The base URL must be `https://`. Plain `http://` is accepted for loopback hosts, and elsewhere only with
-  `allowHttp: true`, since every request carries the bearer token.
-- The token is never logged and never appears in an error message; `headers` cannot override `Authorization`.
+- The base URL must be `https://`, without credentials, a query or a fragment. Plain `http://` is accepted for
+  loopback hosts, and elsewhere only with `allowHttp: true`, since every request carries the bearer token.
+- Redirects are not followed: a 3xx answer is an error, so the request body, which holds the agent endpoint's
+  `authorization`, goes only to the host you configured.
+- The token is never logged and never appears in an error message, also when it is not a usable header value;
+  the headers the client sets (`Authorization`, `Accept`, `Content-Type`, `Last-Event-ID`) replace any you pass
+  in `headers`, whatever the spelling.
 - Everything the server sends is treated as untrusted: a stream line or message over 1 MiB, or a REST body over
-  4 MiB, ends the read instead of growing the process; a known event whose data is not JSON or lacks its required
-  fields is dropped; only ids of a safe shape are sent back as `Last-Event-ID`; a server `retry:` hint is clamped
-  so that it cannot ask for a hot loop, and failures back off with jitter.
+  4 MiB, ends the read instead of growing the process; a 2xx answer is checked against the shape of its route; a
+  known event whose data is not JSON or lacks its required fields is dropped; the keys `__proto__`, `constructor`
+  and `prototype` are left out of everything parsed, at every depth; server text in an error message is cut to 200
+  characters and stripped of control characters; only ids of a safe shape are sent back as `Last-Event-ID`.
+- The client does not hammer a server: a `retry:` hint and every delay you set are held to 100 ms or more, a
+  stream that ends as soon as it opens is redialed with backoff, and failures back off with jitter.
 - No runtime dependencies.
 
 Report a vulnerability as described in [SECURITY.md](SECURITY.md).
