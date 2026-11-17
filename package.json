@@ -1,0 +1,49 @@
+{
+  "name": "@jitsi/voice-agent-client",
+  "version": "0.1.0",
+  "description": "Client for the Jitsi / JaaS voice-agent provisioning API: invite, dismiss, list, get, and a typed lifecycle event stream.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jitsi/voice-agent-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jitsi/voice-agent-client/issues"
+  },
+  "homepage": "https://github.com/jitsi/voice-agent-client#readme",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "jitsi",
+    "jaas",
+    "voice-agent",
+    "server-sent-events"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
