@@ -59,12 +59,67 @@ export async function readText(response: Response, maxBytes: number): Promise<{ 
 /** Visible ASCII, no spaces, at most 256 characters: the only shape of event id the client will send back. */
 export const EVENT_ID_SHAPE = /^[\x21-\x7E]{1,256}$/;
 
+/** Longest conference name the client routes; a tenant and a room are far shorter. */
+const MAX_CONFERENCE_LENGTH = 2048;
+
+/** Keys that would reach an object's prototype if a consumer merged the parsed data. */
+const UNSAFE_KEYS: ReadonlySet<string> = new Set([ '__proto__', 'constructor', 'prototype' ]);
+
+/** `value` without its leading and trailing slashes, in one pass whatever the input. */
+export function trimSlashes(value: string, leading = true): string {
+    let start = 0;
+    let end = value.length;
+
+    while (leading && start < end && value[start] === '/') {
+        start++;
+    }
+    while (end > start && value[end - 1] === '/') {
+        end--;
+    }
+
+    return value.slice(start, end);
+}
+
+/** Text from the server as an error message may carry it: bounded, one line, no control or direction characters. */
+export function printable(text: string, max = 200): string {
+    return text.slice(0, max)
+        .replace(/[\ud800-\udbff]$/, '')
+        .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, ' ');
+}
+
+export const isString = (value: unknown): value is string => typeof value === 'string';
+
+export const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** `JSON.parse` that leaves out the keys in {@link UNSAFE_KEYS}, at every depth. */
+export function parseJson(text: string): unknown {
+    return JSON.parse(text, (key, value) => (UNSAFE_KEYS.has(key) ? undefined : value));
+}
+
+/** Where a 3xx answer points, for the error that reports it; the client does not go there. */
+export function redirectNote(response: Response): string | undefined {
+    return response.status >= 300 && response.status < 400
+        ? `redirect to ${response.headers.get('location') ?? 'an unnamed location'}, not followed`
+        : undefined;
+}
+
+/** The shortest delay a caller's option or a server's `retry:` hint can ask for; below it is a hot loop. */
+export const MIN_RETRY_MS = 100;
+
+/** A delay option as the client uses it: the default when it is not a number, never under {@link MIN_RETRY_MS}. */
+export const delayOption = (ms: number | undefined, fallback: number) =>
+    Math.max(typeof ms === 'number' && Number.isFinite(ms) ? ms : fallback, MIN_RETRY_MS);
+
 /**
  * `<tenant>/<room>` → both parts, `<room>` → the room alone: the tenant lower-cased as the meeting URL spells it,
  * the room as jitsi-meet normalises it (see {@link normalizeRoom}), which is what HAProxy keys its stick table on.
  */
 export function conferenceParts(conference: string): { tenant?: string; room: string } {
-    const trimmed = conference.trim().replace(/^\/+|\/+$/g, '');
+    if (conference.length > MAX_CONFERENCE_LENGTH) {
+        throw new TypeError(`conference is longer than ${MAX_CONFERENCE_LENGTH} characters`);
+    }
+    const trimmed = trimSlashes(conference.trim());
     const slash = trimmed.indexOf('/');
 
     if (!trimmed) {

@@ -1,7 +1,7 @@
 import { VoiceAgentApiError, VoiceAgentStreamError } from './errors.js';
 import { SseParser, type SseMessage } from './sse.js';
 import type { SnapshotAgent, StreamEvent } from './types.js';
-import { EVENT_ID_SHAPE, readText, sleep } from './util.js';
+import { delayOption, EVENT_ID_SHAPE, isRecord, isString, MIN_RETRY_MS, parseJson, printable, readText, redirectNote, sleep } from './util.js';
 
 export interface EventsOptions {
     /** Only this room's events; omit for every room the credential can see. */
@@ -16,8 +16,8 @@ export interface EventsOptions {
 export type StreamOpener = (lastEventId: string | undefined, signal: AbortSignal) => Promise<Response>;
 
 const LIFECYCLE = new Set([ 'agent.connected', 'agent.failed', 'agent.ended' ]);
-/** The shortest reconnect delay a server's `retry:` hint can ask for; below it a hint would be a hot loop. */
-const MIN_RETRY_MS = 100;
+/** A stream that ends sooner than this did not work: it is redialed with backoff, not at once. */
+const MIN_STREAM_MS = 1000;
 /** How much of an error body is kept for the error message. */
 const MAX_ERROR_BODY_BYTES = 65_536;
 
@@ -58,8 +58,8 @@ export class EventStream implements AsyncIterable<StreamEvent> {
 
     async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
         const reconnect = this.options.reconnect ?? true;
-        const initialDelay = typeof reconnect === 'object' ? reconnect.initialDelayMs ?? 1000 : 1000;
-        const maxDelay = typeof reconnect === 'object' ? reconnect.maxDelayMs ?? 30_000 : 30_000;
+        const initialDelay = delayOption(typeof reconnect === 'object' ? reconnect.initialDelayMs : undefined, 1000);
+        const maxDelay = Math.max(delayOption(typeof reconnect === 'object' ? reconnect.maxDelayMs : undefined, 30_000), initialDelay);
         let delay = initialDelay;
         // The server's `retry:` hint, clamped so that a hostile or broken server cannot ask for a hot loop.
         let retryHint: number | undefined;
@@ -85,7 +85,8 @@ export class EventStream implements AsyncIterable<StreamEvent> {
             }
 
             if (response.status !== 200) {
-                const error = new VoiceAgentApiError(response.status, await readBody(response));
+                const body = await readBody(response);
+                const error = new VoiceAgentApiError(response.status, redirectNote(response) ?? body);
 
                 // 429 and 5xx are the server's problem for now; anything else 4xx will not get better by retrying.
                 if (!reconnect || (response.status < 500 && response.status !== 429)) {
@@ -97,12 +98,12 @@ export class EventStream implements AsyncIterable<StreamEvent> {
             const type = response.headers.get('content-type') ?? '';
 
             if (!type.startsWith('text/event-stream')) {
-                throw new VoiceAgentStreamError(`expected text/event-stream, got ${type || 'no content type'}`);
+                throw new VoiceAgentStreamError(`expected text/event-stream, got ${printable(type, 100) || 'no content type'}`);
             }
             if (!response.body) {
                 throw new VoiceAgentStreamError('the event stream has no body');
             }
-            delay = initialDelay;
+            const opened = performance.now();
             let failed = false;
 
             try {
@@ -131,8 +132,13 @@ export class EventStream implements AsyncIterable<StreamEvent> {
             if (this.closed || !reconnect) {
                 return;
             }
-            if (failed) {
-                // A dropped connection or an oversized message: back off like any failure.
+            const lived = performance.now() - opened >= MIN_STREAM_MS;
+
+            if (lived) {
+                delay = initialDelay;
+            }
+            if (failed || !lived) {
+                // A dropped connection, an oversized message, or a stream that ended as soon as it opened.
                 await backoff();
             } else {
                 // A stream the server closed at its max age is resumed at once, or after its own hint.
@@ -146,7 +152,7 @@ async function readBody(response: Response): Promise<unknown> {
     const { text } = await readText(response, MAX_ERROR_BODY_BYTES).catch(() => ({ text: '' }));
 
     try {
-        return text ? JSON.parse(text) : undefined;
+        return text ? parseJson(text) : undefined;
     } catch {
         return text;
     }
@@ -178,11 +184,10 @@ async function* readMessages(body: ReadableStream<Uint8Array>, signal: AbortSign
     }
 }
 
-const isString = (value: unknown): value is string => typeof value === 'string';
+const isStringOrAbsent = (value: unknown) => value === undefined || isString(value);
 
 function isSnapshotAgent(value: unknown): value is SnapshotAgent {
-    return Boolean(value) && typeof value === 'object'
-        && isString((value as SnapshotAgent).agentId) && isString((value as SnapshotAgent).state);
+    return isRecord(value) && isString(value.agentId) && isString(value.state);
 }
 
 /**
@@ -194,14 +199,14 @@ function toStreamEvent(message: SseMessage): StreamEvent | undefined {
     let data: unknown;
 
     try {
-        data = JSON.parse(message.data);
+        data = parseJson(message.data);
     } catch {
         return undefined;
     }
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    if (!isRecord(data)) {
         return undefined;
     }
-    const record = data as Record<string, unknown>;
+    const record = data;
     const name = message.event ?? (isString(record.event) ? record.event : undefined);
 
     if (name === 'snapshot') {
@@ -212,7 +217,12 @@ function toStreamEvent(message: SseMessage): StreamEvent | undefined {
             id: message.id
         };
     }
-    if (name && LIFECYCLE.has(name) && isString(record.agentId) && isString(record.conference) && isString(record.state)) {
+    if (name && LIFECYCLE.has(name) && isString(record.agentId) && isString(record.conference) && isString(record.state)
+            && isStringOrAbsent(record.sourceName) && isStringOrAbsent(record.timestamp)) {
+        if (!isString(record.reason)) {
+            delete record.reason;
+        }
+
         return { ...record, event: name, id: message.id } as StreamEvent;
     }
 

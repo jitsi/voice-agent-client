@@ -14,10 +14,15 @@ export const DEFAULT_MAX_MESSAGE_BYTES = 1_048_576;
  * Incremental parser for `text/event-stream`. Feed it decoded text in any chunking; it returns the messages
  * completed by that chunk. Comments and unknown fields are ignored, `id` persists across messages, and `retry`
  * rides on the message that carried it. A line or a pending message longer than `maxMessageBytes` throws
- * {@link VoiceAgentStreamError}: a stream that never ends its lines must not grow the process without bound.
+ * {@link VoiceAgentStreamError}: a stream that never ends its lines or its messages must not grow the process
+ * without bound. After that error the parser is not reusable.
  */
 export class SseParser {
-    private buffer = '';
+    // The pieces of a line whose end has not arrived; kept apart so that each chunk is scanned once.
+    private pending: string[] = [];
+    private pendingLength = 0;
+    // The last chunk ended with \r: a \n that opens the next one belongs to the same line end.
+    private skipLf = false;
     private data: string[] = [];
     private dataLength = 0;
     private eventName?: string;
@@ -34,34 +39,52 @@ export class SseParser {
                 text = text.slice(1);
             }
         }
-        this.buffer += text;
+        if (this.skipLf && text.length > 0) {
+            this.skipLf = false;
+            if (text.startsWith('\n')) {
+                text = text.slice(1);
+            }
+        }
         const out: SseMessage[] = [];
+        const lineEnd = /\r\n|\n|\r/g;
+        let start = 0;
 
         for (;;) {
-            const idx = this.buffer.search(/\r\n|\n|\r/);
+            lineEnd.lastIndex = start;
+            const match = lineEnd.exec(text);
 
-            if (idx === -1) {
+            if (!match) {
                 break;
             }
-            // A \r at the very end may be the first half of \r\n: wait for the next chunk.
-            if (this.buffer[idx] === '\r' && idx === this.buffer.length - 1) {
-                break;
-            }
-            const line = this.buffer.slice(0, idx);
-            const separator = this.buffer.startsWith('\r\n', idx) ? 2 : 1;
+            const piece = text.slice(start, match.index);
+            const line = this.pending.length === 0 ? piece : this.takePending() + piece;
 
-            this.buffer = this.buffer.slice(idx + separator);
+            start = match.index + match[0].length;
+            this.skipLf = match[0] === '\r' && start === text.length;
             const message = this.line(line);
 
             if (message) {
                 out.push(message);
             }
         }
-        if (this.buffer.length > this.maxMessageBytes) {
-            throw new VoiceAgentStreamError(`event stream line exceeds ${this.maxMessageBytes} bytes`);
+        if (start < text.length) {
+            this.pending.push(text.slice(start));
+            this.pendingLength += text.length - start;
+            if (this.pendingLength > this.maxMessageBytes) {
+                throw new VoiceAgentStreamError(`event stream line exceeds ${this.maxMessageBytes} bytes`);
+            }
         }
 
         return out;
+    }
+
+    private takePending(): string {
+        const head = this.pending.join('');
+
+        this.pending = [];
+        this.pendingLength = 0;
+
+        return head;
     }
 
     private line(line: string): SseMessage | undefined {
@@ -83,7 +106,8 @@ export class SseParser {
             this.eventName = value;
             break;
         case 'data':
-            this.dataLength += value.length;
+            // Plus the newline that joins it to the line before: a line without a value still counts.
+            this.dataLength += value.length + (this.data.length > 0 ? 1 : 0);
             if (this.dataLength > this.maxMessageBytes) {
                 throw new VoiceAgentStreamError(`event stream message exceeds ${this.maxMessageBytes} bytes`);
             }

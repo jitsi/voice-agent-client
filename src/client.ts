@@ -1,7 +1,9 @@
 import { VoiceAgentApiError, VoiceAgentStateError, VoiceAgentStreamError, VoiceAgentTimeoutError } from './errors.js';
 import { EventStream, type EventsOptions } from './events.js';
 import type { AgentState, AgentStatus, InviteRequest, InviteResponse, LifecycleEvent, SnapshotAgent } from './types.js';
-import { conferenceParts, normalizeAgentId, readText, sleep } from './util.js';
+import {
+    conferenceParts, delayOption, isRecord, isString, normalizeAgentId, parseJson, readText, redirectNote, sleep, trimSlashes
+} from './util.js';
 
 export interface VoiceAgentClientOptions {
     /** `https://<jaas-api>/v1/voice-agent`, or `https://<prosody>/voice-agent` when self-hosted. */
@@ -50,7 +52,21 @@ const TERMINAL: ReadonlySet<AgentState> = new Set<AgentState>([ 'failed', 'ended
 /** Largest REST response body the client reads; the API's answers are a few hundred bytes. */
 const MAX_BODY_BYTES = 4_194_304;
 
-const isLoopback = (hostname: string) => hostname === 'localhost' || hostname === '[::1]' || /^127\./.test(hostname);
+/** A token as a header can carry it: visible ASCII and spaces. */
+const TOKEN_SHAPE = /^[\x20-\x7E]+$/;
+
+// An IPv4 host arrives normalised to four decimal parts; 127.example.com is a name, not a loopback address.
+const isLoopback = (hostname: string) => hostname === 'localhost' || hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+
+const isAgentStatus = (value: unknown): value is AgentStatus =>
+    isRecord(value) && isString(value.displayName) && isString(value.sourceName) && isString(value.state);
+
+const isInviteResponse = (value: unknown): value is InviteResponse =>
+    isRecord(value) && isString(value.agentId) && isString(value.sourceName);
+
+function unexpected(route: string): VoiceAgentStreamError {
+    return new VoiceAgentStreamError(`the API answered ${route} with a body of an unexpected shape`);
+}
 
 export class VoiceAgentClient {
     private readonly baseUrl: string;
@@ -75,8 +91,17 @@ export class VoiceAgentClient {
         if (base.protocol === 'http:' ? !(options.allowHttp || isLoopback(base.hostname)) : base.protocol !== 'https:') {
             throw new TypeError(`baseUrl must be https:// (got ${base.protocol}//); set allowHttp: true for a private network`);
         }
+        if (base.username || base.password) {
+            throw new TypeError('baseUrl must not carry credentials; pass the token option');
+        }
+        if (base.search || base.hash) {
+            throw new TypeError('baseUrl must not have a query or a fragment');
+        }
         if (!options.token) {
             throw new TypeError('token is required');
+        }
+        if (isString(options.token) && !TOKEN_SHAPE.test(options.token.trim())) {
+            throw new TypeError('the token has characters a header cannot carry');
         }
         const fetchImpl = options.fetch ?? globalThis.fetch;
 
@@ -86,26 +111,36 @@ export class VoiceAgentClient {
         if (options.routing !== undefined && options.routing !== 'direct' && options.routing !== 'haproxy') {
             throw new TypeError(`routing must be "direct" or "haproxy" (got ${JSON.stringify(options.routing)})`);
         }
-        this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.base = base;
-        this.basePath = base.pathname.replace(/\/+$/, '');
+        this.basePath = trimSlashes(base.pathname, false);
+        this.baseUrl = `${base.origin}${this.basePath}`;
         this.routing = options.routing ?? 'direct';
         this.token = options.token;
         // Called as a plain function: Workers reject the global fetch invoked with the client as `this`.
-        this.fetchImpl = (input, init) => fetchImpl(input, init);
-        this.headers = { ...options.headers ?? {} };
+        // A redirect is an error answer, not followed: it would carry the request body to another origin.
+        this.fetchImpl = (input, init) => fetchImpl(input, { ...init, redirect: 'manual' });
+        // Lower-cased, so that the headers the client sets itself replace a caller's whatever its spelling.
+        this.headers = Object.fromEntries(Object.entries(options.headers ?? {})
+            .map(([ name, value ]) => [ name.toLowerCase(), value ])
+            .filter(([ name ]) => name !== 'last-event-id'));
     }
 
     /** Places an agent in a meeting. Idempotent on `agentId`: an identical repeat returns the existing agent. */
     async invite(request: InviteRequest, options: InviteOptions = {}): Promise<InviteResponse> {
         const wait = options.waitForRoom;
         const timeoutMs = typeof wait === 'object' ? wait.timeoutMs ?? 30_000 : 30_000;
-        const intervalMs = typeof wait === 'object' ? wait.intervalMs ?? 1000 : 1000;
+        const intervalMs = delayOption(typeof wait === 'object' ? wait.intervalMs : undefined, 1000);
         const deadline = Date.now() + timeoutMs;
 
         for (;;) {
             try {
-                return await this.post<InviteResponse>('invite', request, request.conference, options.signal);
+                const answer = await this.post('invite', request, request.conference, options.signal);
+
+                if (!isInviteResponse(answer)) {
+                    throw unexpected('invite');
+                }
+
+                return answer;
             } catch (error) {
                 const roomMissing = error instanceof VoiceAgentApiError && error.status === 404;
 
@@ -118,27 +153,56 @@ export class VoiceAgentClient {
     }
 
     /** Removes an agent and closes its media leg. */
-    dismiss(conference: string, agentId: string, options: RequestOptions = {}): Promise<{ agentId: string }> {
-        return this.post<{ agentId: string }>('dismiss', { conference, agentId }, conference, options.signal);
+    async dismiss(conference: string, agentId: string, options: RequestOptions = {}): Promise<{ agentId: string }> {
+        const answer = await this.post('dismiss', { conference, agentId }, conference, options.signal);
+
+        if (!isRecord(answer) || !isString(answer.agentId)) {
+            throw unexpected('dismiss');
+        }
+
+        return { agentId: answer.agentId };
     }
 
-    /** Every agent in a meeting, keyed by `agentId`. */
+    /** Every agent in a meeting, keyed by `agentId`, in an object without a prototype; other entries are left out. */
     async list(conference: string, options: RequestOptions = {}): Promise<Record<string, AgentStatus>> {
-        const response = await this.getJson<{ agents: Record<string, AgentStatus> }>('list', { conference }, conference, options.signal);
+        const answer = await this.getJson('list', { conference }, conference, options.signal);
+        let listed = isRecord(answer) ? answer.agents ?? {} : undefined;
 
-        return response.agents ?? {};
+        // A server may encode an empty table as an array.
+        if (Array.isArray(listed) && listed.length === 0) {
+            listed = {};
+        }
+        if (!isRecord(listed)) {
+            throw unexpected('list');
+        }
+        const agents: Record<string, AgentStatus> = Object.create(null);
+
+        for (const [ agentId, value ] of Object.entries(listed)) {
+            if (isAgentStatus(value)) {
+                agents[agentId] = value;
+            }
+        }
+
+        return agents;
     }
 
     /** One agent's state, or `undefined` once it is gone. */
     async get(conference: string, agentId: string, options: RequestOptions = {}): Promise<AgentStatus | undefined> {
+        let answer: unknown;
+
         try {
-            return await this.getJson<AgentStatus>('get', { conference, agentId }, conference, options.signal);
+            answer = await this.getJson('get', { conference, agentId }, conference, options.signal);
         } catch (error) {
             if (error instanceof VoiceAgentApiError && error.status === 404) {
                 return undefined;
             }
             throw error;
         }
+        if (!isAgentStatus(answer)) {
+            throw unexpected('get');
+        }
+
+        return answer;
     }
 
     /** The lifecycle event stream; see {@link EventStream}. */
@@ -216,8 +280,14 @@ export class VoiceAgentClient {
 
     private async authHeaders(): Promise<Record<string, string>> {
         const token = typeof this.token === 'function' ? await this.token() : this.token;
+        const value = isString(token) ? token.trim() : '';
 
-        return { authorization: token.startsWith('Bearer ') ? token : `Bearer ${token}` };
+        // Refused here, without the value: fetch would name it in its own error.
+        if (!TOKEN_SHAPE.test(value)) {
+            throw new TypeError('the token is empty or has characters a header cannot carry');
+        }
+
+        return { authorization: value.startsWith('Bearer ') ? value : `Bearer ${value}` };
     }
 
     private url(path: string, query: Record<string, string | undefined> = {}, conference?: string): string {
@@ -254,7 +324,7 @@ export class VoiceAgentClient {
         return url.toString();
     }
 
-    private async post<T>(path: string, body: unknown, conference: string, signal?: AbortSignal): Promise<T> {
+    private async post(path: string, body: unknown, conference: string, signal?: AbortSignal): Promise<unknown> {
         const response = await this.fetchImpl(this.url(path, {}, conference), {
             method: 'POST',
             headers: { ...this.headers, ...await this.authHeaders(), accept: 'application/json', 'content-type': 'application/json' },
@@ -262,20 +332,20 @@ export class VoiceAgentClient {
             signal
         });
 
-        return this.json<T>(response);
+        return this.json(response);
     }
 
-    private async getJson<T>(path: string, query: Record<string, string | undefined>, conference: string, signal?: AbortSignal): Promise<T> {
+    private async getJson(path: string, query: Record<string, string | undefined>, conference: string, signal?: AbortSignal): Promise<unknown> {
         const response = await this.fetchImpl(this.url(path, query, conference), {
             method: 'GET',
             headers: { ...this.headers, ...await this.authHeaders(), accept: 'application/json' },
             signal
         });
 
-        return this.json<T>(response);
+        return this.json(response);
     }
 
-    private async json<T>(response: Response): Promise<T> {
+    private async json(response: Response): Promise<unknown> {
         const { text, truncated } = await readText(response, MAX_BODY_BYTES);
 
         if (truncated) {
@@ -284,14 +354,14 @@ export class VoiceAgentClient {
         let parsed: unknown = text;
 
         try {
-            parsed = text ? JSON.parse(text) : undefined;
+            parsed = text ? parseJson(text) : undefined;
         } catch {
             // keep the text as the body
         }
         if (!response.ok) {
-            throw new VoiceAgentApiError(response.status, parsed);
+            throw new VoiceAgentApiError(response.status, redirectNote(response) ?? parsed);
         }
 
-        return parsed as T;
+        return parsed;
     }
 }

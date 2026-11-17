@@ -1,11 +1,12 @@
 import type { AgentState } from './types.js';
+import { printable } from './util.js';
 
 function describe(body: unknown): string {
     if (body && typeof body === 'object' && 'error' in body && typeof (body as { error: unknown }).error === 'string') {
-        return (body as { error: string }).error;
+        return printable((body as { error: string }).error);
     }
     if (typeof body === 'string' && body) {
-        return body.slice(0, 200);
+        return printable(body);
     }
     return 'no error body';
 }
@@ -23,7 +24,10 @@ export class VoiceAgentApiError extends Error {
     }
 }
 
-/** A response the client refuses to read: not an event stream, no body, or a body or message past its size limit. */
+/**
+ * A response the client refuses to read: not an event stream, no body, a body or message past its size limit, or a
+ * 2xx answer that does not have the shape of its route.
+ */
 export class VoiceAgentStreamError extends Error {
     constructor(message: string) {
         super(message);
@@ -44,7 +48,7 @@ export class VoiceAgentStateError extends Error {
     readonly reason?: string;
 
     constructor(agentId: string, state: AgentState, reason?: string) {
-        super(`agent ${agentId} is ${state}${reason ? ` (${reason})` : ''}`);
+        super(`agent ${agentId} is ${printable(state, 32)}${reason ? ` (${printable(reason)})` : ''}`);
         this.name = 'VoiceAgentStateError';
         this.state = state;
         this.reason = reason;
