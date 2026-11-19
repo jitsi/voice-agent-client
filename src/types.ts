@@ -28,6 +28,7 @@ export interface InviteRequest {
     customParameters?: Record<string, string>;
     callbackUrl?: string;
     mediaFormat?: { encoding: MediaEncoding };
+    /** Unset: `mix`, or `per-source` with `audio/opus`; a deployment from before that default gives `per-source`. */
     fanIn?: FanIn;
     /** Options of the `mix` fan-in (the media contract's **Mix options**); the gateway checks them when it dials. */
     mix?: Record<string, number | boolean | string>;

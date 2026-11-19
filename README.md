@@ -88,14 +88,15 @@ base64-encoded inside it:
 | you → gateway | `end` | Hang up: the agent leaves and `agent.ended` fires |
 
 Audio is PCM16 mono at 24 kHz by default, or Opus passthrough at 48 kHz when the invite sets
-`mediaFormat.encoding: 'audio/opus'`. By default the gateway does not mix: every participant arrives as its own `tag`,
-so your server demultiplexes by `tag`. If your model takes one stream, invite with `fanIn: 'dominant'` to hear one
-speaker at a time, or with `fanIn: 'mix'` (PCM only) to hear everyone the bridge forwards summed into a single stream
-tagged `mix`, which keeps people who talk over each other audible. A mix has costs: the audio no longer says who is
-speaking (the `speakers` message still does, and names who is in the mix), it arrives a jitter buffer later (60 ms by
-default), and every open microphone the bridge forwards is in the sum. The invite's `mix` object sets its options,
-such as `maxSpeakers`. Both sides ignore unknown messages and fields, so the protocol grows without breaking a
-conforming server.
+`mediaFormat.encoding: 'audio/opus'`. An invite that names no `fanIn` gets the `mix`: everyone the bridge forwards
+summed into a single stream tagged `mix`, which suits a model that takes one stream and keeps people who talk over
+each other audible. A mix has costs: the audio no longer says who is speaking (the `speakers` message still does, and
+names who is in the mix), it arrives a jitter buffer later (60 ms by default), and every open microphone the bridge
+forwards is in the sum. The invite's `mix` object sets its options, such as `maxSpeakers`. Invite with
+`fanIn: 'per-source'` to get every participant as its own `tag`, which your server demultiplexes, or with
+`fanIn: 'dominant'` to hear one speaker at a time. A mix is PCM only, so an Opus agent gets `per-source` when it names
+none. A deployment from before `mix` was the default gives `per-source`: name the fan-in your agent depends on. Both
+sides ignore unknown messages and fields, so the protocol grows without breaking a conforming server.
 
 The full contract, with every field, is `AGENT_PROTOCOL.md` in
 [jitsi/opus-transcriber-proxy](https://github.com/jitsi/opus-transcriber-proxy). Any framework that can accept a
