@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The server's default `fanIn` is now `mix` (`per-source` for an Opus agent); documented, no change in the client.
 - `fanIn: 'mix'` and its `mix` options: the gateway sums the participants into one stream (PCM only).
 - `routing: 'haproxy'`: address a sharded deployment through its HAProxy, with the tenant as a path prefix and
   the room as a `room` query parameter spelled as jitsi-meet spells its own (decoded, lower-cased, form-encoded);
